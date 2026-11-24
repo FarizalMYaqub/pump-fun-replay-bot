@@ -251,7 +251,23 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     return true;
   };
 
+  let ridesEntered = 0;
+  let scalpsEntered = 0;
+  let ridesCompleted = 0;
+  let ridesSold = 0;
+  let scalpsSold = 0;
+  let ridePnl = 0;
+  let scalpPnl = 0;
+
   return {
+    onDone(state: BotState): void {
+      // Diagnostics only; stdout stays reply-only, this goes to stderr.
+      console.error(
+        `[surge-snap] rides entered=${ridesEntered} completed=${ridesCompleted} sold=${ridesSold} pnl=${ridePnl.toFixed(3)} ` +
+          `scalps entered=${scalpsEntered} sold=${scalpsSold} pnl=${scalpPnl.toFixed(3)} ` +
+          `fills=${myFills} coins=${myCoins.size} cash=${(Number(state.cash) / LAMPORTS).toFixed(3)}`,
+      );
+    },
     onBatch(state: BotState, batch: Batch): OrderInput[] {
       const now = batch.slot;
       const traded = new Set<Pubkey>();
@@ -268,6 +284,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         }
         if (e.event === 'CreateEvent') {
           tapeOf(e.mint).created = e.slot;
+        } else if (e.event === 'CompleteEvent') {
+          const h = open.get(e.mint);
+          if (h !== undefined && h.kind === 'ride') ridesCompleted++;
         } else if (e.event === 'TradeEvent') {
           const t = tapeOf(e.mint);
           t.ticks.push({
@@ -346,6 +365,13 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         }
         if (sellPending) continue;
         if (orders.length >= cap) break;
+        if (h.kind === 'ride') {
+          ridesSold++;
+          ridePnl += value - cost;
+        } else {
+          scalpsSold++;
+          scalpPnl += value - cost;
+        }
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10000 });
       }
 
@@ -395,6 +421,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const realSol = Number(curve.real_quote_reserves) / LAMPORTS;
         if (rideSignal(t, now, realSol)) {
           if (!tryBuy(mint, p.rideStakeSol)) continue;
+          ridesEntered++;
           open.set(mint, { kind: 'ride', opened: now, peak: 0, invested: p.rideStakeSol, exiting: false, filled: false });
           t.entries++;
           slotsLeft--;
@@ -411,6 +438,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const realSol = Number(curve.real_quote_reserves) / LAMPORTS;
         if (scalpSignal(t, now, realSol)) {
           if (!tryBuy(mint, p.scalpStakeSol)) continue;
+          scalpsEntered++;
           open.set(mint, { kind: 'scalp', opened: now, peak: 0, invested: p.scalpStakeSol, exiting: false, filled: false });
           t.entries++;
           slotsLeft--;
