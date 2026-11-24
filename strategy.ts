@@ -1,112 +1,138 @@
-// Surge Snap — a paper bot for the pump.fun replay (agent-fun/replay/v2).
+// Surge Snap v2 — a paper bot for the pump.fun replay (agent-fun/replay/v2).
 //
-// Idea: buy a coin only while its tape is surging, then snap out fast.
-// A surge is a short burst of mostly-buy trades that lifts the price and
-// keeps it near the burst high, on a curve that already has some real SOL
-// behind it. Every entry is one fixed-size shot; there is no averaging
-// down and no pyramid. Exits are a take-profit, a stop-loss, a trailing
-// stop once the position is up, a fade exit when the tape turns seller,
-// and a hard time cap. A breadth sweep keeps the run above the guardrail
-// bar (round trips on 20+ coins) when the surge signal goes quiet.
+// Two entries, both found by measuring forward returns on the dev window:
+//
+// 1. Completion rider (the main edge). A bonding curve completes when its
+//    real SOL climbs to the migration threshold, and the price at
+//    completion sits far above where the curve was when it was still
+//    climbing. So the bot buys curves whose real SOL is already in the
+//    [45, 90] band while buy flow is still positive and the price is
+//    still rising, then holds for the completion close (the harness
+//    closes the position at the final reserves). A stop-loss, a fade exit
+//    and a hard time cap bound the half of riders that never complete.
+//
+// 2. Surge scalp (breadth). A 20-slot buy burst that lifts the price
+//    keeps drifting up for about 25-50 slots before it rolls over, so a
+//    small fixed-size buy with a tight take-profit and a short time cap
+//    harvests the burst's tail. This also keeps the run above the
+//    guardrail bar (round trips on 20+ coins) on quiet stretches.
 //
 // The bot is deterministic by construction: it reads no clock, no
 // environment and no randomness; it iterates insertion-ordered maps fed
 // by the batch stream, and every price it uses comes from the harness's
-// own reserves. Fees are priced into every decision: a buy pays the
-// 1.25% curve fee plus the harness tx fee, a sell the same again, so a
-// round trip needs roughly +3% just to break even — the take-profit is
-// set well above that and the stop well below it.
+// own reserves. Fees are priced into every decision: a round trip pays
+// the 1.25% curve fee twice plus two tx fees, so a scalp needs roughly
+// +3% just to break even — the rider's +57% mean move to completion is
+// what pays for the book.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
 export interface Params {
-  /** Entry lookback in slots. */
-  window: number;
-  /** Trades in the window. */
-  minTrades: number;
-  /** Buy trades in the window. */
-  minBuys: number;
-  /** Net buy SOL (buys minus sells) over the window. */
-  minNetSol: number;
-  /** Price now over price at window start, minus 1. */
-  minRise: number;
-  /** Upper bound on that rise: skip a coin that already ran too far. */
-  maxRise: number;
-  /** Price now at least this share of the window high. */
-  nearHigh: number;
-  /** Real SOL bounds at entry. */
-  minRealSol: number;
-  maxRealSol: number;
-  /** Slots since the CreateEvent before an entry is allowed. */
-  minAge: number;
-  /** SOL per entry (before the 1%-of-reserve cap). */
-  stakeSol: number;
-  /** Smallest buy worth sending. */
-  minBuySol: number;
-  /** Slippage on buys (bps); sells always go out at 10000. */
+  /** Rider: real SOL band at entry. */
+  rideMinRq: number;
+  rideMaxRq: number;
+  /** Rider: lookback for the flow / rise checks, in slots. */
+  rideWindow: number;
+  /** Rider: net buy SOL over rideWindow. */
+  rideMinNetSol: number;
+  /** Rider: price now over price at rideWindow start, minus 1. */
+  rideMinRise: number;
+  /** Rider: price now at least this share of the window high. */
+  rideNearHigh: number;
+  /** Rider: slots since the CreateEvent before an entry is allowed. */
+  rideMinAge: number;
+  /** Rider: SOL per entry (before the 1%-of-reserve cap). */
+  rideStakeSol: number;
+  /** Rider: stop loss (value <= cost * (1 - rideStop)). */
+  rideStop: number;
+  /** Rider: trailing stop arms once value >= cost * (1 + rideTrailArm). */
+  rideTrailArm: number;
+  /** Rider: then sell when value falls to peak * (1 - rideTrail). */
+  rideTrail: number;
+  /** Rider: take profit (rare; completion usually closes first). */
+  rideTakeProfit: number;
+  /** Rider: fade exit when net SOL over rideFadeWindow < -rideFadeNetSol. */
+  rideFadeWindow: number;
+  rideFadeNetSol: number;
+  /** Rider: hard time cap in slots. */
+  rideMaxHold: number;
+  /** Scalp: entry lookback in slots. */
+  scalpWindow: number;
+  /** Scalp: trades / buys in the window. */
+  scalpMinTrades: number;
+  scalpMinBuys: number;
+  /** Scalp: net buy SOL over the window. */
+  scalpMinNetSol: number;
+  /** Scalp: price rise bounds over the window. */
+  scalpMinRise: number;
+  scalpMaxRise: number;
+  /** Scalp: price now at least this share of the window high. */
+  scalpNearHigh: number;
+  /** Scalp: real SOL bounds at entry. */
+  scalpMinRq: number;
+  scalpMaxRq: number;
+  /** Scalp: slots since the CreateEvent before an entry is allowed. */
+  scalpMinAge: number;
+  /** Scalp: SOL per entry. */
+  scalpStakeSol: number;
+  /** Scalp: take profit / stop loss. */
+  scalpTakeProfit: number;
+  scalpStop: number;
+  /** Scalp: hard time cap in slots. */
+  scalpMaxHold: number;
+  /** Shared. */
   buySlipBps: number;
-  /** Take profit: sell when value >= cost * (1 + takeProfit). */
-  takeProfit: number;
-  /** Stop loss: sell when value <= cost * (1 - stopLoss). */
-  stopLoss: number;
-  /** Trailing stop arms once value >= cost * (1 + trailArm). */
-  trailArm: number;
-  /** Then sell when value falls to peak * (1 - trail). */
-  trail: number;
-  /** Fade exit: sell when net SOL over fadeWindow slots < -fadeNetSol. */
-  fadeWindow: number;
-  fadeNetSol: number;
-  /** Hard time cap in slots. */
-  maxHold: number;
-  /** The time cap does not apply while value >= cost * (1 + holdIfUp). */
-  holdIfUp: number;
-  /** Slots to wait after an exit before the same curve may be bought again. */
   cooldown: number;
-  /** Most entries per curve over the run. */
   maxEntries: number;
-  /** Most SOL at cost across all positions at once. */
   maxExposureSol: number;
-  /** Breadth sweep: target distinct coins and fills over the window. */
   targetCoins: number;
   targetFills: number;
-  /** Block seconds the sweep paces over (the replay is 24h). */
   paceSecs: number;
-  /** Probe buy size (SOL). */
   probeSol: number;
-  /** Most probes open at once. */
   maxProbes: number;
+  minBuySol: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  window: 60,
-  minTrades: 6,
-  minBuys: 5,
-  minNetSol: 0.5,
-  minRise: 0.08,
-  maxRise: 2.0,
-  nearHigh: 0.97,
-  minRealSol: 2,
-  maxRealSol: 120,
-  minAge: 200,
-  stakeSol: 0.25,
-  minBuySol: 0.02,
+  rideMinRq: 45,
+  rideMaxRq: 90,
+  rideWindow: 60,
+  rideMinNetSol: 0.5,
+  rideMinRise: 0.03,
+  rideNearHigh: 0.97,
+  rideMinAge: 100,
+  rideStakeSol: 0.5,
+  rideStop: 0.25,
+  rideTrailArm: 0.4,
+  rideTrail: 0.3,
+  rideTakeProfit: 1.2,
+  rideFadeWindow: 30,
+  rideFadeNetSol: 1,
+  rideMaxHold: 3000,
+  scalpWindow: 20,
+  scalpMinTrades: 4,
+  scalpMinBuys: 3,
+  scalpMinNetSol: 0.3,
+  scalpMinRise: 0.05,
+  scalpMaxRise: 0.5,
+  scalpNearHigh: 0.98,
+  scalpMinRq: 2,
+  scalpMaxRq: 120,
+  scalpMinAge: 200,
+  scalpStakeSol: 0.1,
+  scalpTakeProfit: 0.1,
+  scalpStop: 0.08,
+  scalpMaxHold: 100,
   buySlipBps: 2000,
-  takeProfit: 0.45,
-  stopLoss: 0.3,
-  trailArm: 0.2,
-  trail: 0.25,
-  fadeWindow: 30,
-  fadeNetSol: 0.5,
-  maxHold: 1200,
-  holdIfUp: 0.2,
-  cooldown: 150,
+  cooldown: 300,
   maxEntries: 2,
-  maxExposureSol: 4,
+  maxExposureSol: 5,
   targetCoins: 25,
   targetFills: 240,
   paceSecs: 86400,
   probeSol: 0.02,
   maxProbes: 1,
+  minBuySol: 0.02,
 };
 
 const LAMPORTS = 1e9;
@@ -126,7 +152,10 @@ interface Tape {
   lastExit: number;
 }
 
+type Kind = 'ride' | 'scalp';
+
 interface OpenPos {
+  kind: Kind;
   opened: number;
   peak: number;
   invested: number;
@@ -143,7 +172,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const myCoins = new Set<Pubkey>();
   let firstTime: number | null = null;
   let lastTime: number | null = null;
-  const keep = p.window + 10;
+  const keep = Math.max(p.rideWindow, p.scalpWindow) + 10;
 
   const tapeOf = (mint: Pubkey): Tape => {
     let t = tapes.get(mint);
@@ -165,40 +194,60 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     return net;
   };
 
-  /** Surge signal on a tape at slot `now`. */
-  const surge = (t: Tape, now: number, realSol: number): boolean => {
-    if (realSol < p.minRealSol || realSol > p.maxRealSol) return false;
-    if (t.created === null || now - t.created < p.minAge) return false;
-    const from = now - p.window;
+  /** Price stats over the last `w` slots: start, last, high. */
+  const windowStats = (t: Tape, now: number, w: number): { start: number; last: number; high: number } => {
+    const from = now - w;
+    let start = -1;
+    let last = 0;
+    let high = 0;
+    for (const tick of t.ticks) {
+      if (tick.slot <= from) {
+        start = tick.price;
+        continue;
+      }
+      if (start < 0) start = tick.price;
+      if (tick.price > high) high = tick.price;
+      last = tick.price;
+    }
+    return { start, last, high };
+  };
+
+  /** Rider signal: near completion, still rising on buy flow. */
+  const rideSignal = (t: Tape, now: number, realSol: number): boolean => {
+    if (realSol < p.rideMinRq || realSol > p.rideMaxRq) return false;
+    if (t.created === null || now - t.created < p.rideMinAge) return false;
+    if (flow(t, now, p.rideWindow) < p.rideMinNetSol) return false;
+    const s = windowStats(t, now, p.rideWindow);
+    if (s.start <= 0 || s.last <= 0) return false;
+    if (s.last / s.start - 1 < p.rideMinRise) return false;
+    if (s.last < s.high * p.rideNearHigh) return false;
+    return true;
+  };
+
+  /** Scalp signal: a fresh 20-slot buy burst lifting the price. */
+  const scalpSignal = (t: Tape, now: number, realSol: number): boolean => {
+    if (realSol < p.scalpMinRq || realSol > p.scalpMaxRq) return false;
+    if (t.created === null || now - t.created < p.scalpMinAge) return false;
+    const from = now - p.scalpWindow;
     let trades = 0;
     let buys = 0;
     let buySol = 0;
     let sellSol = 0;
-    let startPrice = -1;
-    let high = 0;
-    let last = 0;
     for (const tick of t.ticks) {
-      if (tick.slot <= from) {
-        startPrice = tick.price;
-        continue;
-      }
-      if (startPrice < 0) startPrice = tick.price;
+      if (tick.slot <= from) continue;
       trades++;
       if (tick.buy) {
         buys++;
         buySol += tick.sol;
-      } else {
-        sellSol += tick.sol;
-      }
-      if (tick.price > high) high = tick.price;
-      last = tick.price;
+      } else sellSol += tick.sol;
     }
-    if (trades < p.minTrades || buys < p.minBuys) return false;
-    if (buySol - sellSol < p.minNetSol) return false;
-    if (startPrice <= 0 || last <= 0) return false;
-    const rise = last / startPrice - 1;
-    if (rise < p.minRise || rise > p.maxRise) return false;
-    if (last < high * p.nearHigh) return false;
+    if (trades < p.scalpMinTrades || buys < p.scalpMinBuys) return false;
+    if (buySol - sellSol < p.scalpMinNetSol) return false;
+    const s = windowStats(t, now, p.scalpWindow);
+    if (s.start <= 0 || s.last <= 0) return false;
+    const rise = s.last / s.start - 1;
+    if (rise < p.scalpMinRise || rise > p.scalpMaxRise) return false;
+    if (s.last < s.high * p.scalpNearHigh) return false;
     return true;
   };
 
@@ -258,7 +307,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         return ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - tx;
       };
 
-      // Exits first: take-profit, stop-loss, trailing stop, fade, time cap.
+      // Exits first, with per-kind rules.
       for (const [mint, h] of open) {
         const pos = state.positions.get(mint);
         const curve = state.curves.get(mint);
@@ -278,11 +327,17 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         if (value > h.peak) h.peak = value;
         let exit = h.exiting;
         const t = tapeOf(mint);
-        if (!exit && value >= cost * (1 + p.takeProfit)) exit = true;
-        if (!exit && value <= cost * (1 - p.stopLoss)) exit = true;
-        if (!exit && h.peak >= cost * (1 + p.trailArm) && value <= h.peak * (1 - p.trail)) exit = true;
-        if (!exit && flow(t, now, p.fadeWindow) < -p.fadeNetSol) exit = true;
-        if (!exit && now - h.opened > p.maxHold && value < cost * (1 + p.holdIfUp)) exit = true;
+        if (h.kind === 'ride') {
+          if (!exit && value >= cost * (1 + p.rideTakeProfit)) exit = true;
+          if (!exit && value <= cost * (1 - p.rideStop)) exit = true;
+          if (!exit && h.peak >= cost * (1 + p.rideTrailArm) && value <= h.peak * (1 - p.rideTrail)) exit = true;
+          if (!exit && flow(t, now, p.rideFadeWindow) < -p.rideFadeNetSol) exit = true;
+          if (!exit && now - h.opened > p.rideMaxHold) exit = true;
+        } else {
+          if (!exit && value >= cost * (1 + p.scalpTakeProfit)) exit = true;
+          if (!exit && value <= cost * (1 - p.scalpStop)) exit = true;
+          if (!exit && now - h.opened > p.scalpMaxHold) exit = true;
+        }
         if (!exit) continue;
         h.exiting = true;
         let sellPending = false;
@@ -307,12 +362,43 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10000 });
       }
 
-      // Entries: one fixed-size shot per surge.
+      // Entries: riders first, then scalps.
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
       let exposure = 0;
       for (const [mint, h] of open) {
         exposure += Math.max(h.invested, Number(state.positions.get(mint)?.cost_lamports ?? 0n) / LAMPORTS);
+      }
+      const tryBuy = (mint: Pubkey, stake: number): boolean => {
+        const capSol = Number(state.maxBuyLamports(mint)) / LAMPORTS;
+        let amount = Math.min(stake, capSol * 0.9, p.maxExposureSol - exposure);
+        if (amount > free - tx) amount = free - tx;
+        if (amount < p.minBuySol) return false;
+        orders.push({
+          side: 'buy',
+          mint,
+          quote_lamports: BigInt(Math.floor(amount * LAMPORTS)),
+          max_slippage_bps: p.buySlipBps,
+        });
+        free -= amount + tx;
+        exposure += amount;
+        return true;
+      };
+      for (const mint of traded) {
+        if (orders.length >= cap) break;
+        if (slotsLeft <= 0) break;
+        const curve = state.curves.get(mint);
+        if (curve === undefined || curve.complete) continue;
+        if (pendingByMint.has(mint) || probes.has(mint) || open.has(mint)) continue;
+        const t = tapes.get(mint)!;
+        if (t.entries >= p.maxEntries || now - t.lastExit < p.cooldown) continue;
+        const realSol = Number(curve.real_quote_reserves) / LAMPORTS;
+        if (rideSignal(t, now, realSol)) {
+          if (!tryBuy(mint, p.rideStakeSol)) continue;
+          open.set(mint, { kind: 'ride', opened: now, peak: 0, invested: p.rideStakeSol, exiting: false, filled: false });
+          t.entries++;
+          slotsLeft--;
+        }
       }
       for (const mint of traded) {
         if (orders.length >= cap) break;
@@ -323,22 +409,12 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const t = tapes.get(mint)!;
         if (t.entries >= p.maxEntries || now - t.lastExit < p.cooldown) continue;
         const realSol = Number(curve.real_quote_reserves) / LAMPORTS;
-        if (!surge(t, now, realSol)) continue;
-        const capSol = Number(state.maxBuyLamports(mint)) / LAMPORTS;
-        let amount = Math.min(p.stakeSol, capSol * 0.9, p.maxExposureSol - exposure);
-        if (amount > free - tx) amount = free - tx;
-        if (amount < p.minBuySol) continue;
-        orders.push({
-          side: 'buy',
-          mint,
-          quote_lamports: BigInt(Math.floor(amount * LAMPORTS)),
-          max_slippage_bps: p.buySlipBps,
-        });
-        free -= amount + tx;
-        exposure += amount;
-        open.set(mint, { opened: now, peak: 0, invested: amount, exiting: false, filled: false });
-        t.entries++;
-        slotsLeft--;
+        if (scalpSignal(t, now, realSol)) {
+          if (!tryBuy(mint, p.scalpStakeSol)) continue;
+          open.set(mint, { kind: 'scalp', opened: now, peak: 0, invested: p.scalpStakeSol, exiting: false, filled: false });
+          t.entries++;
+          slotsLeft--;
+        }
       }
 
       // Breadth sweep: when fills or coins lag the pace, open a tiny probe
